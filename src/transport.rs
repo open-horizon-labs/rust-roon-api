@@ -286,7 +286,7 @@ impl Transport {
         moo.send_req(SVCNAME.to_owned() + "/mute", Some(body)).await.ok()
     }
 
-    pub async fn change_volume(&self, output_id: &str, how: &volume::ChangeMode, value: i32) -> Option<usize> {
+    pub async fn change_volume(&self, output_id: &str, how: &volume::ChangeMode, value: f64) -> Option<usize> {
         let moo = self.moo.as_ref()?;
         let how = how.serialize(serde_json::value::Serializer).ok()?;
         let body = json!({
