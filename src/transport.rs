@@ -41,9 +41,9 @@ pub mod volume {
         pub value: Option<f32>,
         pub step: Option<f32>,
         pub is_muted: Option<bool>,
-        pub hard_limit_min: f32,
-        pub hard_limit_max: f32,
-        pub soft_limit: f32,
+        #[serde(default)] pub hard_limit_min: Option<f32>,
+        #[serde(default)] pub hard_limit_max: Option<f32>,
+        #[serde(default)] pub soft_limit: Option<f32>,
     }
 }
 
