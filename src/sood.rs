@@ -4,6 +4,7 @@ use std::collections::{hash_map, HashMap};
 use std::str::from_utf8;
 use std::sync::Arc;
 use futures_util::Future;
+use futures_util::future::select_all;
 use socket2::{Socket, Domain, Type, Protocol};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc::{self, Receiver}, Mutex};
@@ -26,14 +27,14 @@ pub struct Message {
 }
 
 struct Multicast {
-    recv_sock: UdpSocket,
-    send_sock: UdpSocket,
+    recv_sock: Arc<UdpSocket>,
+    send_sock: Arc<UdpSocket>,
     broadcast: Ipv4Addr,
     seq: i32
 }
 
 struct Unicast {
-    send_sock: UdpSocket
+    send_sock: Arc<UdpSocket>
 }
 
 impl Sood {
@@ -48,76 +49,51 @@ impl Sood {
     pub async fn start(&mut self) -> std::io::Result<(impl Future<Output = ()>, Receiver<Message>)> {
         self.init_socket().await?;
 
-        let unicast = self.unicast.clone();
-        let multicast = self.multicast.clone();
         let (tx, rx) = mpsc::channel::<Message>(4);
 
+        // Snapshot every socket that can receive SOOD responses. The receive task
+        // awaits recv_from directly, so it only wakes when a datagram arrives;
+        // query() keeps sending through the shared map without contention.
+        let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
+
+        if let Some(unicast) = &self.unicast {
+            sockets.push(unicast.lock().await.send_sock.clone());
+        }
+
+        for mc in (*self.multicast.lock().await).values() {
+            sockets.push(mc.send_sock.clone());
+            sockets.push(mc.recv_sock.clone());
+        }
+
         let handle = async move {
-            let mut buf = [0u8; 1024];
+            let mut sockets = sockets;
 
-            'sood: loop {
-                if let Some(unicast) = &unicast {
-                    match unicast.lock().await.send_sock.try_recv_from(&mut buf) {
-                        Ok((size, from)) => {
-                            let buf = &buf[..size];
+            while !sockets.is_empty() {
+                let recvs = sockets.iter().cloned().map(|sock| {
+                    Box::pin(async move {
+                        let mut buf = [0u8; 1024];
+                        let result = sock.recv_from(&mut buf).await;
 
-                            if let Some(msg)= Message::new(buf, from) {
-                                if let Err(err) = tx.send(msg).await {
-                                    log::error!("{}", err);
-                                    break 'sood;
-                                }
+                        (result, buf)
+                    })
+                });
+
+                let ((result, buf), index, _) = select_all(recvs).await;
+
+                match result {
+                    Ok((size, from)) => {
+                        if let Some(msg) = Message::new(&buf[..size], from) {
+                            if let Err(err) = tx.send(msg).await {
+                                log::error!("{}", err);
+                                break;
                             }
                         }
-                        Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                        }
-                        Err(err) => {
-                            log::error!("{}", err);
-                            break 'sood;
-                        }
+                    }
+                    Err(err) => {
+                        log::error!("{}", err);
+                        sockets.remove(index);
                     }
                 }
-
-                for mc in (*multicast.lock().await).values() {
-                    match mc.send_sock.try_recv_from(&mut buf) {
-                        Ok((size, from)) => {
-                            let buf = &buf[..size];
-
-                            if let Some(msg)= Message::new(buf, from) {
-                                if let Err(err) = tx.send(msg).await{
-                                    log::error!("{}", err);
-                                    break 'sood;
-                                }
-                            }
-                        }
-                        Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                        }
-                        Err(err) => {
-                            log::error!("{}", err);
-                            break 'sood;
-                        }
-                    }
-
-                    match mc.recv_sock.try_recv_from(&mut buf) {
-                        Ok((size, from)) => {
-                            let buf = &buf[..size];
-
-                            if let Some(msg)= Message::new(buf, from) {
-                                if let Err(err) = tx.send(msg).await{
-                                    log::error!("{}", err);
-                                    break 'sood;
-                                }
-                            }
-                        }
-                        Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                        }
-                        Err(err) => {
-                            log::error!("{}", err);
-                            break 'sood;
-                        }
-                    }
-                }
-
-                sleep(Duration::from_millis(10)).await;
             }
         };
 
@@ -239,8 +215,8 @@ impl Sood {
 
 impl Message {
     fn new(buf: &[u8], from: SocketAddr) -> Option<Self> {
-        if from_utf8(&buf[0..5]).unwrap() == "SOOD\u{2}" {
-            let msg_type = from_utf8(&buf[5..6]).unwrap().chars().next().unwrap();
+        if buf.len() >= 6 && &buf[0..5] == "SOOD\u{2}".as_bytes() {
+            let msg_type = buf[5] as char;
             let mut pos = 6;
             let mut props: HashMap<String, String> = HashMap::new();
 
@@ -252,20 +228,25 @@ impl Message {
                     return None;
                 }
 
-                let name = from_utf8(&buf[pos..pos+len]).unwrap();
+                let name = from_utf8(&buf[pos..pos+len]).ok()?;
 
                 pos += len;
+
+                if pos + 2 > buf.len() {
+                    return None;
+                }
+
                 len = ((buf[pos] as usize) << 8) | (buf[pos + 1] as usize);
+                pos += 2;
 
                 if pos + len > buf.len() {
                     return None;
                 }
-                pos += 2;
 
                 let value = if len == 0 {
                     ""
                 } else {
-                    from_utf8(&buf[pos..pos+len]).unwrap()
+                    from_utf8(&buf[pos..pos+len]).ok()?
                 };
 
                 pos += len;
@@ -297,8 +278,8 @@ impl Multicast {
         recv_socket.set_reuse_address(true)?;
         recv_socket.set_nonblocking(true)?;
         recv_socket.bind(&SocketAddr::from(([0; 4], SOOD_PORT)).into())?;
-        let recv_sock = UdpSocket::from_std(recv_socket.into())?;
-        let send_sock = UdpSocket::bind(SocketAddr::from((ip_octets, 0))).await?;
+        let recv_sock = Arc::new(UdpSocket::from_std(recv_socket.into())?);
+        let send_sock = Arc::new(UdpSocket::bind(SocketAddr::from((ip_octets, 0))).await?);
         let broadcast = Ipv4Addr::from(broadcast_octets);
 
         recv_sock.join_multicast_v4(Ipv4Addr::from(SOOD_MULTICAST_IP), ip)?;
@@ -316,7 +297,7 @@ impl Multicast {
 
 impl Unicast {
     async fn new() -> std::io::Result<Self> {
-        let send_sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let send_sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
         send_sock.set_broadcast(true)?;
         send_sock.set_multicast_ttl_v4(1)?;

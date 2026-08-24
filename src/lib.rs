@@ -284,23 +284,25 @@ impl RoonApi {
                 }
             }
 
-            loop {
-                if let Some(mut msg) = sood_rx.recv().await {
-                    if let Some((unique_id, port)) = is_service_response(SERVICE_ID, &mut msg) {
-                        let mut sood_conns = sood_conns_clone.lock().await;
+            // recv() returns None once the SOOD socket task exits; break instead
+            // of spinning on a closed channel.
+            while let Some(mut msg) = sood_rx.recv().await {
+                if let Some((unique_id, port)) = is_service_response(SERVICE_ID, &mut msg) {
+                    let mut sood_conns = sood_conns_clone.lock().await;
 
-                        log::debug!("sood received: {}", unique_id);
+                    log::debug!("sood received: {}", unique_id);
 
-                        if !sood_conns.contains(&unique_id) {
-                            sood_conns.push(unique_id.to_owned());
+                    if !sood_conns.contains(&unique_id) {
+                        sood_conns.push(unique_id.to_owned());
 
-                            if let Ok(moo_tuple) = Moo::new(&msg.ip, &port).await {
-                                moo_tx.send(moo_tuple).await.unwrap();
-                            }
+                        if let Ok(moo_tuple) = Moo::new(&msg.ip, &port).await {
+                            moo_tx.send(moo_tuple).await.unwrap();
                         }
                     }
                 }
             }
+
+            log::warn!("sood receiver stopped: discovery socket task exited");
         };
 
         let mut handles = JoinSet::new();
