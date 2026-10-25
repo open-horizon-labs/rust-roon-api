@@ -414,16 +414,21 @@ impl Transport {
         }
     }
 
-    pub async fn subscribe_queue(&self, zone_or_output_id: &str, max_item_count: u32) {
-        if let Some(moo) = &self.moo {
-            let args = json!({
-                "zone_or_output_id": zone_or_output_id,
-                "max_item_count": max_item_count,
-            });
-            let sub = moo.send_sub_req(SVCNAME, "queue", Some(args)).await.ok();
-
-            *self.queue_sub.lock().await = sub;
-        }
+    /// Subscribe to a bounded queue window and return its MOO request ID.
+    /// Consumers can correlate the initial snapshot with this subscription,
+    /// including when an older parsed snapshot is still queued for delivery.
+    pub async fn subscribe_queue(&self, zone_or_output_id: &str, max_item_count: u32) -> Option<usize> {
+        let moo = self.moo.as_ref()?;
+        let args = json!({
+            "zone_or_output_id": zone_or_output_id,
+            "max_item_count": max_item_count,
+        });
+        // Hold the slot until registration is complete: a fast response must
+        // not be parsed before its request ID is installed.
+        let mut slot = self.queue_sub.lock().await;
+        let sub = moo.send_sub_req(SVCNAME, "queue", Some(args)).await.ok()?;
+        *slot = Some(sub);
+        Some(sub.0)
     }
 
     pub async fn unsubscribe_queue(&self) {
@@ -548,6 +553,12 @@ mod tests {
 
     use super::*;
     use crate::{RoonApi, CoreEvent, Info, Svc, Services, info};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_queue_subscription_has_no_request_id() {
+        let request_id: Option<usize> = Transport::new().subscribe_queue("zone", 51).await;
+        assert_eq!(request_id, None);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn it_works() {

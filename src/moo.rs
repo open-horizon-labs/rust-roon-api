@@ -122,15 +122,19 @@ impl Moo {
     }
 
     pub async fn send_req(&self, name: String, body: Option<serde_json::Value>) -> Result<usize, SendError<(usize, String)>> {
-        let req_id = self.req_id.lock().unwrap().to_owned();
+        // Reserve before awaiting capacity. Other senders may run while this
+        // request is queued; they must not observe the same ID.
+        let req_id = {
+            let mut next = self.req_id.lock().unwrap();
+            let id = *next;
+            *next += 1;
+            id
+        };
         let (msg_string, log_string) = Moo::create_msg_string(req_id, &["REQUEST", &name], body.as_ref());
 
         self.msg_tx.send((req_id, msg_string)).await?;
 
         log::info!("{}", log_string);
-
-        let mut next_req_id = self.req_id.lock().unwrap();
-        *next_req_id += 1;
 
         Ok(req_id)
     }
@@ -138,8 +142,11 @@ impl Moo {
     pub async fn send_sub_req(&self, svc_name: &str, req_name: &str, args: Option<serde_json::Value>) -> Result<(usize, usize), SendError<(usize, String)>> {
         let body;
 
-        let mut sub_key = *self.sub_key.lock().unwrap();
-        sub_key += 1;
+        let sub_key = {
+            let mut next = self.sub_key.lock().unwrap();
+            *next += 1;
+            *next
+        };
 
         if let Some(mut args) = args {
             args["subscription_key"] = sub_key.into();
@@ -374,5 +381,53 @@ impl MooReceiver {
         } else {
             Some((msg, ContentType::Void))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_reserve_distinct_ids_before_waiting_for_capacity() {
+        let (msg_tx, mut receiver) = mpsc::channel(1);
+        let moo = Moo {
+            id: 0,
+            req_id: Arc::new(Mutex::new(0)),
+            msg_tx,
+            sub_key: Arc::new(Mutex::new(0)),
+        };
+        let first_id = moo.send_req("first".to_string(), None).await.unwrap();
+        let second = moo.send_req("second".to_string(), None);
+        let third = moo.send_req("third".to_string(), None);
+        futures_util::pin_mut!(second, third);
+        assert!(futures_util::poll!(second.as_mut()).is_pending());
+        assert!(futures_util::poll!(third.as_mut()).is_pending());
+        receiver.recv().await.unwrap();
+        let second_id = second.await.unwrap();
+        receiver.recv().await.unwrap();
+        let third_id = third.await.unwrap();
+        assert_ne!(first_id, second_id);
+        assert_ne!(second_id, third_id, "concurrent sends must not share a request ID");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscriptions_have_distinct_keys_and_unsubscribe_the_original() {
+        let (msg_tx, mut receiver) = mpsc::channel(10);
+        let moo = Moo {
+            id: 0,
+            req_id: Arc::new(Mutex::new(0)),
+            msg_tx,
+            sub_key: Arc::new(Mutex::new(0)),
+        };
+        let first = moo.send_sub_req("transport", "queue", None).await.unwrap();
+        let second = moo.send_sub_req("transport", "queue", None).await.unwrap();
+        assert_ne!(first.0, second.0);
+        assert_ne!(first.1, second.1, "an old unsubscribe must not address the new subscription");
+        receiver.recv().await.unwrap();
+        receiver.recv().await.unwrap();
+        moo.send_unsub_req("transport", "queue", first.1).await.unwrap();
+        let (_, frame) = receiver.recv().await.unwrap();
+        assert!(frame.contains(&format!("\"subscription_key\":{}", first.1)));
     }
 }
